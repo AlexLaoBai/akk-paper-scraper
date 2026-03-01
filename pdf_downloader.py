@@ -1,69 +1,227 @@
 #!/usr/bin/env python3
 """
-PDF Downloader - Downloads PDFs with retry logic
+PDF Downloader - Advanced PDF downloader for academic papers
+Supports multiple sources: PubMed, PMC, Frontiers, Springer, Nature, BMC, etc.
 """
 
 import os
+import re
+import csv
 import time
+import hashlib
 import requests
-from typing import Dict, Optional
-from tqdm import tqdm
+from urllib.parse import urljoin, urlparse
+from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class PDFDownloader:
-    """Downloads PDF files from URLs"""
+    """Advanced PDF downloader with multi-source support"""
 
-    def __init__(self, output_dir: str, max_retries: int = 3):
-        self.output_dir = output_dir
+    PDF_PATTERNS = {
+        'pubmed': [
+            r'https://pubmed\.ncbi\.nlm\.nih\.gov/\d+/',
+            r'https://www\.ncbi\.nlm\..nih\.gov/pmc/articles/PMC\d+/',
+        ],
+        'frontiers': [
+            r'https://www\.frontiersin\.org/articles/\d+/\d+/full',
+            r'https://www\.frontiersin\.org/articles/.*/pdf',
+        ],
+        'springer': [
+            r'https://link\.springer\.com/article/\d+',
+            r'https://link\.springer\.com/content/pdf/.*\.pdf',
+        ],
+        'nature': [
+            r'https://www\.nature\.com/articles/',
+            r'https://www\.nature\.com/articles/.*\.pdf',
+        ],
+        'bmc': [
+            r'https://bmcmicrobiol\.biomedcentral\.com/articles/',
+            r'https://bmcmicrobiol\.biomedcentral\.com/.*/.*\.pdf',
+        ],
+        'elsevier': [
+            r'https://www\.sciencedirect\.com/science/article/',
+        ],
+        'wiley': [
+            r'https://onlinelibrary\.wiley\.com/doi/',
+            r'https://onlinelibrary\.wiley\.com/doi/pdfdirect/',
+        ],
+        'pmc': [
+            r'https://www\.ncbi\.nlm\.nih\.gov/pmc/articles/PMC\d+/pdf/',
+        ],
+    }
+
+    PDF_ENDPOINTS = {
+        'frontiers': '/articles/{article_id}/pdf',
+        'springer': '/content/pdf/{article_id}.pdf',
+        'nature': '/articles/{article_id}/.pdf',
+        'bmc': '/{article_id}/.pdf',
+    }
+
+    def __init__(self, timeout=30, max_retries=3):
+        self.timeout = timeout
         self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'AKK-Paper-Scraper/1.0'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
 
-    def download(self, paper: Dict) -> bool:
-        """Download PDF for a paper"""
-        if not paper.get('pdf_url'):
-            return False
+    def load_papers_from_csv(self, csv_path):
+        """Load paper data from CSV file"""
+        papers = []
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                papers.append({
+                    'title': row.get('title', ''),
+                    'doi': row.get('doi', ''),
+                    'pmid': row.get('pmid', ''),
+                    'pmc': row.get('pmc', ''),
+                    'url': row.get('url', ''),
+                    'journal': row.get('journal', ''),
+                    'year': row.get('year', ''),
+                })
+        return papers
 
-        pdf_url = paper['pdf_url']
-        filename = self._get_filename(paper)
-        filepath = os.path.join(self.output_dir, filename)
+    def scrape_pubmed_recent(self, keywords, max_results=20):
+        """Scrape recent papers from PubMed (simplified)"""
+        logger.info(f"Searching PubMed for: {keywords}")
+        logger.info(f"Note: For production use, install Biopython and use Entrez API")
+        return []
 
-        # Skip if already exists
-        if os.path.exists(filepath):
-            return True
+    def find_pdf_url(self, paper_url):
+        """Find PDF URL from paper page"""
+        pdf_url = None
 
-        for attempt in range(self.max_retries):
-            try:
-                return self._download_file(pdf_url, filepath)
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+        if 'pmc' in paper_url.lower() and '/pdf' not in paper_url:
+            pdf_url = paper_url.rstrip('/') + '/pdf/'
+        elif paper_url.lower().endswith('.pdf'):
+            pdf_url = paper_url
+        elif 'frontiers' in paper_url.lower():
+            pdf_url = paper_url.rstrip('/') + '/pdf'
+        elif 'springer' in paper_url.lower():
+            parsed = urlparse(paper_url)
+            article_id = parsed.path.split('/')[-1]
+            pdf_url = f"https://link.springer.com/content/pdf/{article_id}.pdf"
+        elif 'nature' in paper_url.lower():
+            parsed = urlparse(paper_url)
+            article_id = parsed.path.split('/')[-1]
+            pdf_url = f"https://www.nature.com/articles/{article_id}.pdf"
+        elif 'bmc' in paper_url.lower():
+            parsed = urlparse(paper_url)
+            parts = parsed.path.strip('/').split('/')
+            article_id = parts[-1] if parts else ''
+            pdf_url = f"https://bmcmicrobiol.biomedcentral.com/{article_id}.pdf"
+
+        return pdf_url
+
+    def download_pdf(self, url, output_path, filename=None):
+        """Download a single PDF file"""
+        if not url:
+            return False, "No URL provided"
+
+        try:
+            if not filename:
+                parsed = urlparse(url)
+                filename = os.path.basename(parsed.path)
+                if not filename.endswith('.pdf'):
+                    filename += '.pdf'
+
+            filename = self._clean_filename(filename)
+            filepath = os.path.join(output_path, filename)
+
+            if os.path.exists(filepath):
+                logger.info(f"File already exists: {filename}")
+                return True, filepath
+
+            for attempt in range(self.max_retries):
+                try:
+                    response = self.session.get(url, timeout=self.timeout, stream=True)
+                    response.raise_for_status()
+
+                    with open(filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                    if os.path.getsize(filepath) > 1000:
+                        logger.info(f"Downloaded: {filename}")
+                        return True, filepath
+                    else:
+                        os.remove(filepath)
+                        logger.warning(f"File too small, deleted: {filename}")
+
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(2 ** attempt)
+
+            return False, "Download failed after retries"
+
+        except Exception as e:
+            return False, str(e)
+
+    def download_from_doi(self, doi, output_path):
+        """Download PDF using DOI"""
+        sources = [
+            f"https://api.unpaywall.org/v2/{doi}?email=example@example.com",
+        ]
+
+        try:
+            response = self.session.get(sources[0], timeout=self.timeout)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('best_oa_location'):
+                    pdf_url = data['best_oa_location'].get('url_for_pdf')
+                    if pdf_url:
+                        return self.download_pdf(pdf_url, output_path)
+            return False, "No open access PDF found"
+        except Exception as e:
+            return False, str(e)
+
+    def download_all(self, papers, output_dir):
+        """Download all papers"""
+        os.makedirs(output_dir, exist_ok=True)
+
+        success_count = 0
+        for i, paper in enumerate(papers):
+            logger.info(f"Processing {i+1}/{len(papers)}: {paper.get('title', 'Unknown')[:50]}...")
+
+            pdf_url = None
+
+            if paper.get('url'):
+                pdf_url = self.find_pdf_url(paper['url'])
+
+            if not pdf_url and paper.get('pmc'):
+                pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{paper['pmc']}/pdf/"
+
+            if not pdf_url and paper.get('doi'):
+                result, path = self.download_from_doi(paper['doi'], output_dir)
+                if result:
+                    success_count += 1
                     continue
-                print(f"Error downloading {filename}: {e}")
-                return False
 
-        return False
+            if pdf_url:
+                result, message = self.download_pdf(pdf_url, output_dir)
+                if result:
+                    success_count += 1
 
-    def _download_file(self, url: str, filepath: str) -> bool:
-        """Download a file with progress"""
-        response = self.session.get(url, stream=True, timeout=60)
-        response.raise_for_status()
+            time.sleep(1)
 
-        total_size = int(response.headers.get('content-length', 0))
+        return success_count
 
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+    def _clean_filename(self, filename):
+        """Clean filename to remove invalid characters"""
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        if len(filename) > 200:
+            name, ext = os.path.splitext(filename)
+            filename = name[:200-len(ext)] + ext
+        return filename
 
-        return True
 
-    def _get_filename(self, paper: Dict) -> str:
-        """Generate filename from paper metadata"""
-        arxiv_id = paper.get('arxiv_id', 'unknown')
-        title = paper.get('title', 'untitled')[:50]
-        # Sanitize filename
-        title = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in title)
-        return f"{arxiv_id}_{title}.pdf"
+if __name__ == "__main__":
+    downloader = PDFDownloader()
+    print("PDF Downloader initialized")
+    print("Supported sources:", list(downloader.PDF_PATTERNS.keys()))
